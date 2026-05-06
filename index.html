@@ -1,554 +1,995 @@
 <html lang="pt-BR"><head>
-<meta charset="utf-8"/>
+<script id="aura-supabase-token-firewall">(function () {
+  if (window.__AURA_SUPABASE_FIREWALL__) return;
+  window.__AURA_SUPABASE_FIREWALL__ = true;
+
+  var SUPABASE_HOST = "hoirqrkdgbmvpwutwuwj.supabase.co";
+  var BLOCKED_KEY_PATTERNS = [
+    /^sb-[a-z0-9-]+-auth-token$/i,
+    /^supabase\.auth\.token$/i
+  ];
+
+  function isBlockedStorageKey(key) {
+    if (typeof key !== "string") return false;
+    for (var i = 0; i < BLOCKED_KEY_PATTERNS.length; i++) {
+      if (BLOCKED_KEY_PATTERNS[i].test(key)) return true;
+    }
+    return false;
+  }
+
+  function toAbsoluteUrl(input) {
+    try {
+      return new URL(input, window.location.href);
+    } catch {
+      return null;
+    }
+  }
+
+  function isSupabaseDestination(input) {
+    var parsed = toAbsoluteUrl(input);
+    if (!parsed) return false;
+    if (SUPABASE_HOST && parsed.host === SUPABASE_HOST) return true;
+    return parsed.host.endsWith(".supabase.co");
+  }
+
+  function pathLooksSensitive(input) {
+    var parsed = toAbsoluteUrl(input);
+    if (!parsed) return false;
+    return /^\/(auth|rest|functions)\/v1\//.test(parsed.pathname || "");
+  }
+
+  function headersContainAuth(headersLike) {
+    if (!headersLike) return false;
+
+    try {
+      if (typeof Headers !== "undefined" && headersLike instanceof Headers) {
+        return !!(headersLike.get("authorization") || headersLike.get("apikey"));
+      }
+    } catch {}
+
+    if (Array.isArray(headersLike)) {
+      for (var i = 0; i < headersLike.length; i++) {
+        var pair = headersLike[i] || [];
+        var name = String(pair[0] || "").toLowerCase();
+        if (name === "authorization" || name === "apikey") return true;
+      }
+      return false;
+    }
+
+    if (typeof headersLike === "object") {
+      var keys = Object.keys(headersLike);
+      for (var j = 0; j < keys.length; j++) {
+        var k = keys[j].toLowerCase();
+        if (k === "authorization" || k === "apikey") return true;
+      }
+    }
+    return false;
+  }
+
+  function requestLooksSensitive(input, init, extraHeaders) {
+    var url = "";
+    try {
+      if (typeof input === "string") {
+        url = input;
+      } else if (input && typeof input.url === "string") {
+        url = input.url;
+      }
+    } catch {}
+
+    var headers =
+      (init && init.headers) ||
+      (input && input.headers) ||
+      extraHeaders ||
+      null;
+    var hasAuthHeaders = headersContainAuth(headers);
+    if (hasAuthHeaders) return true;
+
+    if (!url) return false;
+    if (isSupabaseDestination(url) && pathLooksSensitive(url)) return true;
+    return false;
+  }
+
+  function patchStorage(storage, storageName) {
+    if (!storage) return;
+    var proto = Object.getPrototypeOf(storage);
+    if (!proto || proto.__auraSupabaseFirewallPatched) return;
+
+    var rawGetItem = proto.getItem;
+    var rawSetItem = proto.setItem;
+    var rawRemoveItem = proto.removeItem;
+    var rawClear = proto.clear;
+    var rawKey = proto.key;
+    var rawLengthDescriptor = Object.getOwnPropertyDescriptor(proto, "length");
+    var rawLengthGet = rawLengthDescriptor && rawLengthDescriptor.get;
+
+    function getRawLength(instance) {
+      try {
+        if (rawLengthGet) return Number(rawLengthGet.call(instance) || 0);
+      } catch {}
+      try {
+        return Number(instance.length || 0);
+      } catch {}
+      return 0;
+    }
+
+    function getVisibleKeys(instance) {
+      var visible = [];
+      var total = getRawLength(instance);
+      for (var i = 0; i < total; i++) {
+        var currentKey = rawKey.call(instance, i);
+        if (currentKey && !isBlockedStorageKey(currentKey)) {
+          visible.push(currentKey);
+        }
+      }
+      return visible;
+    }
+
+    function maskBlockedKeyProperty(instance, keyName) {
+      if (!keyName || !isBlockedStorageKey(keyName)) return;
+      try {
+        Object.defineProperty(instance, keyName, {
+          configurable: true,
+          enumerable: false,
+          get: function () {
+            return null;
+          },
+          set: function () {
+            return true;
+          }
+        });
+      } catch {}
+    }
+
+    function syncBlockedKeyProperties(instance) {
+      var total = getRawLength(instance);
+      for (var i = 0; i < total; i++) {
+        var k = rawKey.call(instance, i);
+        if (k) maskBlockedKeyProperty(instance, k);
+      }
+    }
+
+    proto.getItem = function (key) {
+      syncBlockedKeyProperties(this);
+      if (isBlockedStorageKey(String(key))) return null;
+      return rawGetItem.call(this, key);
+    };
+
+    proto.setItem = function (key, value) {
+      if (isBlockedStorageKey(String(key))) return;
+      return rawSetItem.call(this, key, value);
+    };
+
+    proto.removeItem = function (key) {
+      if (isBlockedStorageKey(String(key))) return;
+      return rawRemoveItem.call(this, key);
+    };
+
+    proto.clear = function () {
+      if (typeof rawClear !== "function") return;
+
+      // Preserve blocked keys across clear() to prevent auth token/session wipe.
+      var preservedBlockedEntries = [];
+      var total = getRawLength(this);
+      for (var i = 0; i < total; i++) {
+        var blockedKey = rawKey.call(this, i);
+        if (blockedKey && isBlockedStorageKey(blockedKey)) {
+          preservedBlockedEntries.push([
+            blockedKey,
+            rawGetItem.call(this, blockedKey),
+          ]);
+        }
+      }
+
+      rawClear.call(this);
+
+      for (var j = 0; j < preservedBlockedEntries.length; j++) {
+        var entry = preservedBlockedEntries[j];
+        var key = entry[0];
+        var value = entry[1];
+        if (typeof key === "string" && typeof value === "string") {
+          rawSetItem.call(this, key, value);
+        }
+      }
+
+      syncBlockedKeyProperties(this);
+    };
+
+    proto.key = function (index) {
+      syncBlockedKeyProperties(this);
+      var visible = getVisibleKeys(this);
+      return visible[index] || null;
+    };
+
+    try {
+      Object.defineProperty(proto, "length", {
+        configurable: true,
+        enumerable: false,
+        get: function () {
+          syncBlockedKeyProperties(this);
+          return getVisibleKeys(this).length;
+        }
+      });
+    } catch {}
+
+    var proxyStorage = null;
+    try {
+      proxyStorage = new Proxy(storage, {
+        get: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return null;
+          if (prop === "length") return getVisibleKeys(target).length;
+          if (prop === "key") {
+            return function (index) {
+              var visible = getVisibleKeys(target);
+              return visible[index] || null;
+            };
+          }
+          if (prop === "clear") {
+            return function () {
+              if (typeof rawClear !== "function") return;
+
+              var preservedBlockedEntries = [];
+              var total = getRawLength(target);
+              for (var i = 0; i < total; i++) {
+                var blockedKey = rawKey.call(target, i);
+                if (blockedKey && isBlockedStorageKey(blockedKey)) {
+                  preservedBlockedEntries.push([
+                    blockedKey,
+                    rawGetItem.call(target, blockedKey),
+                  ]);
+                }
+              }
+
+              rawClear.call(target);
+
+              for (var j = 0; j < preservedBlockedEntries.length; j++) {
+                var entry = preservedBlockedEntries[j];
+                var key = entry[0];
+                var value = entry[1];
+                if (typeof key === "string" && typeof value === "string") {
+                  rawSetItem.call(target, key, value);
+                }
+              }
+
+              syncBlockedKeyProperties(target);
+            };
+          }
+
+          var value = target[prop];
+          if (typeof value === "function") return value.bind(target);
+          return value;
+        },
+        set: function (target, prop, value) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return true;
+          target[prop] = value;
+          return true;
+        },
+        has: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return false;
+          return prop in target;
+        },
+        deleteProperty: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) return true;
+          try {
+            delete target[prop];
+          } catch {}
+          return true;
+        },
+        ownKeys: function (target) {
+          return getVisibleKeys(target);
+        },
+        getOwnPropertyDescriptor: function (target, prop) {
+          if (typeof prop === "string" && isBlockedStorageKey(prop)) {
+            return undefined;
+          }
+          if (prop === "length") {
+            return {
+              configurable: true,
+              enumerable: false,
+              value: getVisibleKeys(target).length,
+              writable: false
+            };
+          }
+          return Object.getOwnPropertyDescriptor(target, prop);
+        }
+      });
+    } catch {}
+
+    try {
+      if (proxyStorage) {
+        Object.defineProperty(window, storageName, {
+          configurable: true,
+          enumerable: true,
+          get: function () {
+            return proxyStorage;
+          }
+        });
+      }
+    } catch {}
+
+    syncBlockedKeyProperties(storage);
+    proto.__auraSupabaseFirewallPatched = true;
+  }
+
+  function patchCookieAccess() {
+    try {
+      var cookieDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "cookie");
+      if (!cookieDescriptor || !cookieDescriptor.configurable) return;
+
+      Object.defineProperty(document, "cookie", {
+        configurable: true,
+        enumerable: false,
+        get: function () {
+          return "";
+        },
+        set: function () {
+          return true;
+        }
+      });
+    } catch {}
+  }
+
+  function patchFetch() {
+    if (typeof window.fetch !== "function") return;
+    var rawFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      if (requestLooksSensitive(input, init, null)) {
+        return Promise.reject(new Error("Blocked by Aura security policy"));
+      }
+      return rawFetch(input, init);
+    };
+  }
+
+  function patchXHR() {
+    if (typeof XMLHttpRequest === "undefined") return;
+    var rawOpen = XMLHttpRequest.prototype.open;
+    var rawSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    var rawSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__auraRequestUrl = String(url || "");
+      this.__auraHeaders = {};
+      return rawOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (!this.__auraHeaders) this.__auraHeaders = {};
+      this.__auraHeaders[String(name || "").toLowerCase()] = String(value || "");
+      return rawSetHeader.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      if (requestLooksSensitive(this.__auraRequestUrl || "", null, this.__auraHeaders || null)) {
+        throw new Error("Blocked by Aura security policy");
+      }
+      return rawSend.apply(this, arguments);
+    };
+  }
+
+  function patchBeacon() {
+    if (typeof navigator.sendBeacon !== "function") return;
+    var rawBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      if (requestLooksSensitive(url, null, null)) return false;
+      return rawBeacon(url, data);
+    };
+  }
+
+  function patchWebSocket() {
+    if (typeof WebSocket === "undefined") return;
+    var RawWebSocket = WebSocket;
+    window.WebSocket = function (url, protocols) {
+      if (requestLooksSensitive(String(url || ""), null, null)) {
+        throw new Error("Blocked by Aura security policy");
+      }
+      return new RawWebSocket(url, protocols);
+    };
+    window.WebSocket.prototype = RawWebSocket.prototype;
+  }
+
+  patchStorage(window.localStorage, "localStorage");
+  patchStorage(window.sessionStorage, "sessionStorage");
+  patchCookieAccess();
+  patchFetch();
+  patchXHR();
+  patchBeacon();
+  patchWebSocket();
+})();</script><meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<title>Lumify Est&eacute;tica | Beleza com Excel&ecirc;ncia Cl&iacute;nica</title>
+<title>Lumify Estética | Excelência em Estética</title>
 <script src="assets/resource_3fa48481346f"></script>
 <script src="assets/iconify-icon_e19829e7f0e8.js"></script>
-<link href="assets/css2_61218cbecd6c.css" rel="stylesheet"/>
-</head>
-<style>
-html { scroll-behavior: smooth; }
-@media (max-width: 767px) {
-  /* Disable image hover effects on mobile */
-  .group img { transition: none !important; }
-  .group:hover img { transform: none !important; filter: none !important; opacity: inherit !important; mix-blend-mode: inherit !important; }
-  /* Disable card hover effects on mobile */
-  .group:hover { box-shadow: none !important; }
-  /* Treatment cards: full color on mobile */
-  #servicos .group img { filter: none !important; opacity: 1 !important; mix-blend-mode: normal !important; }
-  /* Carousel cards: full color on mobile */
-  #resultados .group img { mix-blend-mode: normal !important; opacity: 1 !important; }
-  /* Disable arrow reveal on mobile */
-  .group:hover .opacity-0 { opacity: 0 !important; transform: translateX(-1rem) !important; }
-  /* Disable border color shift on mobile */
-  .group:hover [class*="border-white"] { border-color: rgba(255,255,255,0.1) !important; }
-}
-</style>
-<body class="antialiased text-[#1A1A1A] bg-[#F9F8F6] font-light selection:bg-[#BBA88E] selection:text-white" style="font-family: 'Inter', sans-serif;">
-
-<!-- ===================== NAVIGATION ===================== -->
-<nav class="sticky top-0 z-50 bg-white/90 backdrop-blur-md border-b border-[#EBE9E4] py-4 px-8 flex justify-between items-center">
-  <a class="text-xl tracking-tighter uppercase font-medium" href="#">Lumify</a>
-  <div class="hidden md:flex gap-12 text-sm tracking-wide">
-    <a class="hover:text-[#BBA88E] transition-colors" href="#servicos">Servi&ccedil;os</a>
-    <a class="hover:text-[#BBA88E] transition-colors" href="#sobre">Sobre</a>
-    <a class="hover:text-[#BBA88E] transition-colors" href="#resultados">Resultados</a>
-    <a class="hover:text-[#BBA88E] transition-colors" href="#depoimentos">Depoimentos</a>
-    <a class="hover:text-[#BBA88E] transition-colors" href="#contato">Contato</a>
-  </div>
-  <a class="text-xs uppercase tracking-widest border border-[#1A1A1A]/20 px-6 py-3 rounded-full hover:bg-[#1A1A1A] hover:text-white transition-colors" href="#contato">Agendar</a>
-</nav>
-
-<!-- ===================== HERO ===================== -->
-<header class="relative min-h-screen flex items-center pt-24 pb-32 overflow-hidden bg-[#1A1A1A]">
-  <!-- Background Video + Image Fallback -->
-  <div class="absolute inset-0 bg-cover bg-center opacity-60 bg-[url(https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/variants/08f0e618-c8f0-4948-b2e8-28376317b11c/1600w.jpg)]"></div>
-  <div class="absolute top-0 right-0 bottom-0 left-0 bg-[#1A1A1A] overflow-hidden">
-    <video autoplay="" class="absolute inset-0 w-full h-full object-cover opacity-60" loop="" muted="" playsinline="">
-      <source src="assets/NEW-VIDEO-SLIDER_d843b950f411.mp4" type="video/mp4"/>
-    </video>
-    <div class="absolute inset-0 bg-gradient-to-r from-[#1A1A1A]/90 via-[#1A1A1A]/50 to-transparent"></div>
-  </div>
-  <div class="relative z-10 w-full max-w-7xl mx-auto px-8 flex flex-col lg:flex-row justify-between items-center gap-16 lg:gap-8">
-    <!-- Left: Typography -->
-    <div class="max-w-2xl text-white">
-      <h1 class="text-5xl md:text-6xl lg:text-7xl font-normal tracking-tight leading-tight mb-8" style="font-family: 'Cormorant Garamond', serif;">
-        Beleza que nasce da ci&ecirc;ncia, <br/>perfeita em cada detalhe.
-      </h1>
-      <p class="text-base md:text-lg text-white/80 font-light mb-12 max-w-lg leading-relaxed">
-        Tratamentos est&eacute;ticos avan&ccedil;ados com tecnologia de ponta e atendimento humanizado. Rosto, corpo e bem-estar em um &uacute;nico lugar.
-      </p>
-      <div class="flex flex-wrap items-center gap-6">
-        <a class="bg-white text-[#1A1A1A] text-sm uppercase tracking-widest px-8 py-4 rounded-full hover:bg-[#BBA88E] hover:text-white transition-colors duration-500" href="#servicos">
-          Conhe&ccedil;a nossos tratamentos
-        </a>
-        <a class="flex items-center gap-3 text-sm uppercase tracking-widest text-white hover:text-[#BBA88E] transition-colors duration-500" href="#contato">
-          Agendar consulta
-          <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
-        </a>
-      </div>
-    </div>
-    <!-- Right: Floating Card -->
-    <div class="w-full max-w-md bg-white/5 backdrop-blur-xl border border-white/10 p-8 rounded-sm text-white">
-      <div class="text-xs uppercase tracking-widest text-[#BBA88E] mb-8">Seu momento de transforma&ccedil;&atilde;o</div>
-      <div class="space-y-6">
-        <a class="group flex items-center justify-between border-b border-white/10 pb-6 hover:border-white/40 transition-colors" href="#servicos">
-          <div class="flex items-center gap-4">
-            <iconify-icon class="text-2xl text-white/50 group-hover:text-[#BBA88E] transition-colors" icon="solar:stars-linear"></iconify-icon>
-            <span class="text-lg font-light tracking-wide">Tratamentos faciais</span>
-          </div>
-          <iconify-icon class="text-xl opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" icon="solar:alt-arrow-right-linear"></iconify-icon>
-        </a>
-        <a class="group flex items-center justify-between border-b border-white/10 pb-6 hover:border-white/40 transition-colors" href="#servicos">
-          <div class="flex items-center gap-4">
-            <iconify-icon class="text-2xl text-white/50 group-hover:text-[#BBA88E] transition-colors" icon="solar:body-outline"></iconify-icon>
-            <span class="text-lg font-light tracking-wide">Modelagem corporal</span>
-          </div>
-          <iconify-icon class="text-xl opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" icon="solar:alt-arrow-right-linear"></iconify-icon>
-        </a>
-        <a class="group flex items-center justify-between pb-2 hover:border-white/40 transition-colors" href="#contato">
-          <div class="flex items-center gap-4">
-            <iconify-icon class="text-2xl text-white/50 group-hover:text-[#BBA88E] transition-colors" icon="solar:calendar-linear"></iconify-icon>
-            <span class="text-lg font-light tracking-wide">Agendamento online</span>
-          </div>
-          <iconify-icon class="text-xl opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" icon="solar:alt-arrow-right-linear"></iconify-icon>
-        </a>
-      </div>
-    </div>
-  </div>
-  <!-- Sub-nav Banner -->
-  <div class="absolute bottom-0 w-full border-t border-white/10 bg-[#1A1A1A]/60 backdrop-blur-md">
-    <div class="max-w-7xl mx-auto px-8 flex flex-wrap justify-between items-center py-5 text-xs text-white/60 uppercase tracking-[0.2em]">
-      <span class="hover:text-white cursor-pointer transition-colors">Harmoniza&ccedil;&atilde;o</span>
-      <span class="hover:text-white cursor-pointer transition-colors">Laser</span>
-      <span class="hover:text-white cursor-pointer transition-colors">Skin Care</span>
-      <span class="hover:text-white cursor-pointer transition-colors">Corpo</span>
-      <span class="hover:text-[#BBA88E] cursor-pointer transition-colors">Bem-estar</span>
-    </div>
-  </div>
-</header>
-
-<!-- ===================== POR QUE LUMIFY ===================== -->
-<section class="py-32 px-8 max-w-7xl mx-auto">
-  <div class="mb-20 max-w-3xl">
-    <h2 class="text-4xl md:text-5xl tracking-tight leading-tight mb-6" style="font-family: 'Cormorant Garamond', serif;">
-      A excel&ecirc;ncia cl&iacute;nica a servi&ccedil;o <br/>da sua beleza.
-    </h2>
-    <p class="text-base text-gray-500">Um cuidado completo que une tecnologia de &uacute;ltima gera&ccedil;&atilde;o, protocolos cient&iacute;ficos e atendimento personalizado.</p>
-  </div>
-  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-8 gap-y-12">
-    <!-- Card 1 -->
-    <div class="relative group">
-      <div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">01</div>
-      <h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Tecnologia certificada</h3>
-      <p class="text-sm text-gray-500 leading-relaxed">
-        Equipamentos de &uacute;ltima gera&ccedil;&atilde;o, certificados pela ANVISA, para resultados comprovados e seguros em cada procedimento.
-      </p>
-    </div>
-    <!-- Card 2 -->
-    <div class="relative group">
-      <div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">02</div>
-      <h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Profissionais especializados</h3>
-      <p class="text-sm text-gray-500 leading-relaxed">
-        Equipe m&eacute;dica e de esteticistas com forma&ccedil;&atilde;o cont&iacute;nua e certifica&ccedil;&atilde;o nos protocolos mais avan&ccedil;ados do mercado.
-      </p>
-    </div>
-    <!-- Card 3 -->
-    <div class="relative group">
-      <div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">03</div>
-      <h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Protocolos personalizados</h3>
-      <p class="text-sm text-gray-500 leading-relaxed">
-        Cada paciente recebe um plano de tratamento &uacute;nico, baseado em an&aacute;lise cl&iacute;nica detalhada e objetivos individuais.
-      </p>
-    </div>
-    <!-- Card 4 -->
-    <div class="relative group">
-      <div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">04</div>
-      <h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Acompanhamento cont&iacute;nuo</h3>
-      <p class="text-sm text-gray-500 leading-relaxed">
-        Retornos peri&oacute;dicos, ajustes de protocolo e suporte dedicado para garantir resultados duradouros e satisfat&oacute;rios.
-      </p>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== SERVIÇOS ===================== -->
-<section id="servicos" class="bg-[#EBE9E4] py-32 px-8">
-  <div class="max-w-7xl mx-auto">
-    <h2 class="text-4xl tracking-tight mb-16 text-center" style="font-family: 'Cormorant Garamond', serif;">
-      Nossos tratamentos
-    </h2>
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <!-- Facial -->
-      <a class="group relative aspect-[4/3] overflow-hidden bg-white" href="#contato">
-        <img alt="Tratamentos Faciais" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-80 mix-blend-multiply grayscale group-hover:grayscale-0" src="https://images.unsplash.com/photo-1643684391140-c5056cfd3436?w=1200&auto=format&fit=crop&q=80"/>
-        <div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/80 via-[#1A1A1A]/20 to-transparent"></div>
-        <div class="absolute bottom-0 left-0 p-10 w-full text-white">
-          <div class="flex justify-between items-end">
-            <div>
-              <h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Rosto &amp; Anti-idade</h3>
-              <p class="text-sm text-white/70 font-light max-w-sm">Rejuvenescimento celular, botox, preenchimento e protocolos assinatura.</p>
-            </div>
-            <div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
-              <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
-            </div>
-          </div>
-        </div>
-      </a>
-      <!-- Corpo -->
-      <a class="group relative aspect-[4/3] overflow-hidden bg-white" href="#contato">
-        <img alt="Modelagem Corporal" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-80 mix-blend-multiply grayscale group-hover:grayscale-0" src="https://images.unsplash.com/photo-1570454564834-efe597f09fe4?w=1200&auto=format&fit=crop&q=80"/>
-        <div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/80 via-[#1A1A1A]/20 to-transparent"></div>
-        <div class="absolute bottom-0 left-0 p-10 w-full text-white">
-          <div class="flex justify-between items-end">
-            <div>
-              <h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Modelagem Corporal</h3>
-              <p class="text-sm text-white/70 font-light max-w-sm">Criolip&oacute;lise, radiofrequ&ecirc;ncia e redu&ccedil;&atilde;o localizada de gordura.</p>
-            </div>
-            <div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
-              <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
-            </div>
-          </div>
-        </div>
-      </a>
-      <!-- Depilação -->
-      <a class="group relative aspect-[4/3] overflow-hidden bg-white" href="#contato">
-        <img alt="Depila&ccedil;&atilde;o a Laser" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-80 mix-blend-multiply grayscale group-hover:grayscale-0" src="https://images.unsplash.com/photo-1746806942799-b4db209e9a6b?w=1200&auto=format&fit=crop&q=80"/>
-        <div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/80 via-[#1A1A1A]/20 to-transparent"></div>
-        <div class="absolute bottom-0 left-0 p-10 w-full text-white">
-          <div class="flex justify-between items-end">
-            <div>
-              <h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Depila&ccedil;&atilde;o a Laser</h3>
-              <p class="text-sm text-white/70 font-light max-w-sm">Diodo de alta pot&ecirc;ncia para todos os fot&oacute;tipos, r&aacute;pido e indolor.</p>
-            </div>
-            <div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
-              <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
-            </div>
-          </div>
-        </div>
-      </a>
-      <!-- Skin Tech -->
-      <a class="group relative aspect-[4/3] overflow-hidden bg-[#1A1A1A]" href="#contato">
-        <img alt="Skin Tech &amp; IA" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-60 mix-blend-luminosity grayscale group-hover:grayscale-0 group-hover:opacity-100 group-hover:mix-blend-normal" src="https://images.unsplash.com/photo-1689103722266-1f2f837145e7?w=1200&auto=format&fit=crop&q=80"/>
-        <div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/90 via-[#1A1A1A]/40 to-transparent"></div>
-        <div class="absolute top-10 right-10">
-          <span class="bg-[#BBA88E] text-white text-xs uppercase tracking-widest px-4 py-2 rounded-full">Novo</span>
-        </div>
-        <div class="absolute bottom-0 left-0 p-10 w-full text-white">
-          <div class="flex justify-between items-end">
-            <div>
-              <h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Skin Tech &amp; IA</h3>
-              <p class="text-sm text-white/70 font-light max-w-sm">An&aacute;lise de pele por intelig&ecirc;ncia artificial para prescri&ccedil;&atilde;o precisa.</p>
-            </div>
-            <div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
-              <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
-            </div>
-          </div>
-        </div>
-      </a>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== PARA QUEM ===================== -->
-<section class="py-32 px-8 max-w-7xl mx-auto border-b border-[#EBE9E4]">
-  <div class="text-center mb-20">
-    <h2 class="text-4xl tracking-tight mb-6" style="font-family: 'Cormorant Garamond', serif;">
-      Um plano para cada necessidade
-    </h2>
-    <p class="text-sm uppercase tracking-widest text-gray-400">Escolha seu perfil</p>
-  </div>
-  <div class="grid grid-cols-1 md:grid-cols-3 gap-px bg-[#EBE9E4] border border-[#EBE9E4]">
-    <!-- Perfil 1 -->
-    <div class="bg-[#F9F8F6] p-12 hover:bg-white transition-colors duration-500">
-      <div class="w-12 h-12 bg-[#EBE9E4] rounded-full flex items-center justify-center mb-8">
-        <iconify-icon class="text-2xl text-[#1A1A1A]" icon="solar:shop-linear"></iconify-icon>
-      </div>
-      <h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Preven&ccedil;&atilde;o &amp; Manuten&ccedil;&atilde;o</h3>
-      <p class="text-sm text-gray-500 mb-8 min-h-[4rem]">Cuidados regulares para manter a pele jovem, saud&aacute;vel e com vi&ccedil;o natural por mais tempo.</p>
-      <ul class="space-y-3 mb-10 text-sm">
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Limpeza de pele profunda</li>
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Peeling qu&iacute;mico</li>
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Skin Boosters</li>
-      </ul>
-      <a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] hover:text-[#BBA88E] transition-colors pb-1 border-b border-[#1A1A1A] hover:border-[#BBA88E]" href="#contato">
-        Ver protocolos
-      </a>
-    </div>
-    <!-- Perfil 2 -->
-    <div class="bg-[#F9F8F6] p-12 hover:bg-white transition-colors duration-500">
-      <div class="w-12 h-12 bg-[#EBE9E4] rounded-full flex items-center justify-center mb-8">
-        <iconify-icon class="text-2xl text-[#1A1A1A]" icon="solar:health-linear"></iconify-icon>
-      </div>
-      <h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Transforma&ccedil;&atilde;o</h3>
-      <p class="text-sm text-gray-500 mb-8 min-h-[4rem]">Resultados vis&iacute;veis com protocolos combinados para quem busca uma mudan&ccedil;a real no visual.</p>
-      <ul class="space-y-3 mb-10 text-sm">
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Botox &amp; Preenchimento</li>
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Fios de sustenta&ccedil;&atilde;o</li>
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Lipo enzim&aacute;tica</li>
-      </ul>
-      <a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] hover:text-[#BBA88E] transition-colors pb-1 border-b border-[#1A1A1A] hover:border-[#BBA88E]" href="#contato">
-        Agendar avalia&ccedil;&atilde;o
-      </a>
-    </div>
-    <!-- Perfil 3 -->
-    <div class="bg-[#F9F8F6] p-12 hover:bg-white transition-colors duration-500">
-      <div class="w-12 h-12 bg-[#EBE9E4] rounded-full flex items-center justify-center mb-8">
-        <iconify-icon class="text-2xl text-[#1A1A1A]" icon="solar:stethoscope-linear"></iconify-icon>
-      </div>
-      <h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Bem-estar &amp; Relaxamento</h3>
-      <p class="text-sm text-gray-500 mb-8 min-h-[4rem]">Tratamentos que unem est&eacute;tica e terapia para corpo e mente em perfeito equil&iacute;brio.</p>
-      <ul class="space-y-3 mb-10 text-sm">
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Massagem modeladora</li>
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Drenagem linf&aacute;tica</li>
-        <li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Spa Day completo</li>
-      </ul>
-      <a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] hover:text-[#BBA88E] transition-colors pb-1 border-b border-[#1A1A1A] hover:border-[#BBA88E]" href="#contato">
-        Conhecer pacotes
-      </a>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== SOBRE + RESULTADOS ===================== -->
-<section id="sobre" class="py-32 px-8 max-w-7xl mx-auto">
-  <div class="flex flex-col lg:flex-row gap-20 items-center">
-    <div class="flex-1 space-y-12">
-      <div>
-        <h2 class="text-4xl tracking-tight mb-6" style="font-family: 'Cormorant Garamond', serif;">
-          Mais que uma cl&iacute;nica, <br/>uma experi&ecirc;ncia de cuidado.
-        </h2>
-        <p class="text-base text-gray-500 max-w-md">
-          Na Lumify, cada detalhe &eacute; pensado para proporcionar conforto, seguran&ccedil;a e resultados que superam expectativas. Nosso compromisso &eacute; com a sua autoestima.
-        </p>
-      </div>
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
-        <div class="border-l border-[#BBA88E] pl-6">
-          <iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:verified-check-linear"></iconify-icon>
-          <h4 class="text-base font-medium mb-2">+3.000 atendimentos</h4>
-          <p class="text-xs text-gray-500">Pacientes satisfeitos com resultados comprovados.</p>
-        </div>
-        <div class="border-l border-[#BBA88E] pl-6">
-          <iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:diploma-linear"></iconify-icon>
-          <h4 class="text-base font-medium mb-2">Equipe certificada</h4>
-          <p class="text-xs text-gray-500">Profissionais com forma&ccedil;&atilde;o cont&iacute;nua e especializada.</p>
-        </div>
-        <div class="border-l border-[#BBA88E] pl-6">
-          <iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:shield-check-linear"></iconify-icon>
-          <h4 class="text-base font-medium mb-2">Seguran&ccedil;a total</h4>
-          <p class="text-xs text-gray-500">Equipamentos certificados e ambiente esterilizado.</p>
-        </div>
-        <div class="border-l border-[#BBA88E] pl-6">
-          <iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:heart-linear"></iconify-icon>
-          <h4 class="text-base font-medium mb-2">Atendimento humanizado</h4>
-          <p class="text-xs text-gray-500">Cada paciente &eacute; &uacute;nico e recebe aten&ccedil;&atilde;o exclusiva.</p>
-        </div>
-      </div>
-    </div>
-    <div class="flex-1 w-full relative">
-      <div class="aspect-square bg-[#EBE9E4] relative p-8">
-        <div class="absolute inset-0 bg-[url('https://images.unsplash.com/photo-1629909613654-28e377c37b09?q=80&amp;w=1200&amp;auto=format&amp;fit=crop')] bg-cover bg-center mix-blend-luminosity opacity-40"></div>
-        <div class="relative z-10 h-full flex flex-col justify-between">
-          <div class="self-end bg-white p-6 shadow-sm max-w-[200px]">
-            <div class="text-3xl text-[#BBA88E] mb-1" style="font-family: 'Cormorant Garamond', serif;">98%</div>
-            <div class="text-xs text-gray-500 uppercase tracking-wider">&Iacute;ndice de satisfa&ccedil;&atilde;o</div>
-          </div>
-          <div class="bg-[#1A1A1A] p-6 shadow-sm max-w-[240px] text-white">
-            <iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:verified-check-linear"></iconify-icon>
-            <div class="text-sm font-medium mb-1">Resultados desde a 1&ordf; sess&atilde;o</div>
-            <div class="text-xs text-white/60">Protocolos que entregam o que prometem.</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== TECNOLOGIAS (CAROUSEL) ===================== -->
-<section id="resultados" class="overflow-hidden text-white bg-[#1A1A1A] pt-32 pr-8 pb-32 pl-8">
-  <div class="max-w-7xl mx-auto">
-    <div class="flex justify-between items-end mb-16">
-      <div>
-        <h2 class="text-4xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">
-          Nossas tecnologias
-        </h2>
-        <p class="text-sm text-white/60 max-w-sm">Equipamentos de ponta para tratamentos que realmente funcionam.</p>
-      </div>
-      <div class="hidden md:flex gap-4">
-        <button class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
-          <iconify-icon class="text-xl" icon="solar:arrow-left-linear"></iconify-icon>
-        </button>
-        <button class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
-          <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
-        </button>
-      </div>
-    </div>
-    <div id="tech-carousel" class="flex gap-8 overflow-x-auto pb-8 snap-x" style="scrollbar-width: none;">
-      <!-- Tech 1 -->
-      <div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
-        <div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
-          <img alt="HIFU Ultra" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="https://images.pexels.com/photos/30809943/pexels-photo-30809943.jpeg?auto=compress&cs=tinysrgb&dpr=1&w=800"/>
-          <div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
-        </div>
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Lifting Facial</div>
-            <h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">HIFU Ultra</h3>
-            <p class="text-sm text-white/50">Ultrassom microfocado</p>
-          </div>
-          <iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
-        </div>
-      </div>
-      <!-- Tech 2 -->
-      <div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
-        <div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
-          <img alt="Laser Fracionado" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="https://images.pexels.com/photos/4586726/pexels-photo-4586726.jpeg?auto=compress&cs=tinysrgb&dpr=1&w=800"/>
-          <div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
-        </div>
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Rejuvenescimento</div>
-            <h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Laser Fracionado</h3>
-            <p class="text-sm text-white/50">CO2 fracionado premium</p>
-          </div>
-          <iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
-        </div>
-      </div>
-      <!-- Tech 3 -->
-      <div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
-        <div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
-          <img alt="Criolip&oacute;lise" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="https://images.pexels.com/photos/7772656/pexels-photo-7772656.jpeg?auto=compress&cs=tinysrgb&dpr=1&w=800"/>
-          <div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
-        </div>
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Gordura Localizada</div>
-            <h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Criolip&oacute;lise</h3>
-            <p class="text-sm text-white/50">Congelamento de gordura</p>
-          </div>
-          <iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
-        </div>
-      </div>
-      <!-- Tech 4 -->
-      <div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
-        <div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
-          <img alt="Radiofrequ&ecirc;ncia" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="https://images.pexels.com/photos/36930299/pexels-photo-36930299.jpeg?auto=compress&cs=tinysrgb&dpr=1&w=800"/>
-          <div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
-        </div>
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Firmeza &amp; Lifting</div>
-            <h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Radiofrequ&ecirc;ncia</h3>
-            <p class="text-sm text-white/50">RF multipolar fracionada</p>
-          </div>
-          <iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
-        </div>
-      </div>
-    </div>
-    <!-- Progress indicator (mobile only) -->
-    <div id="carousel-dots" class="mt-8 flex gap-2 md:hidden">
-      <div class="h-[2px] w-12 bg-white transition-colors duration-300"></div>
-      <div class="h-[2px] w-12 bg-white/20 transition-colors duration-300"></div>
-      <div class="h-[2px] w-12 bg-white/20 transition-colors duration-300"></div>
-      <div class="h-[2px] w-12 bg-white/20 transition-colors duration-300"></div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== DEPOIMENTOS ===================== -->
-<section id="depoimentos" class="py-32 px-8 max-w-7xl mx-auto">
-  <div class="flex flex-col lg:flex-row gap-16">
-    <div class="lg:w-1/3">
-      <div class="sticky top-32">
-        <h2 class="text-4xl tracking-tight mb-6" style="font-family: 'Cormorant Garamond', serif;">
-          O que nossos <br/>pacientes dizem
-        </h2>
-        <p class="text-sm text-gray-500 mb-8 leading-relaxed">
-          Hist&oacute;rias reais de transforma&ccedil;&atilde;o e satisfa&ccedil;&atilde;o. Cada depoimento reflete o cuidado e a dedica&ccedil;&atilde;o da equipe Lumify.
-        </p>
-        <a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] pb-1 border-b border-[#1A1A1A] hover:text-[#BBA88E] hover:border-[#BBA88E] transition-colors" href="#contato">
-          Ver todos os depoimentos
-        </a>
-      </div>
-    </div>
-    <div class="lg:w-2/3 space-y-8">
-      <!-- Depoimento 1 -->
-      <div class="group bg-white p-8 border border-[#EBE9E4] hover:shadow-lg hover:shadow-gray-100 transition-all duration-500">
-        <div class="text-xs text-[#8F9A90] uppercase tracking-widest mb-3">Tratamento Facial</div>
-        <h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Renata Oliveira, 42 anos</h3>
-        <p class="text-sm text-gray-500 mb-6">&ldquo;Fiz o protocolo completo de rejuvenescimento e os resultados foram incr&iacute;veis. Minha pele nunca esteve t&atilde;o firme e luminosa. A equipe &eacute; excepcional.&rdquo;</p>
-        <div class="flex items-center gap-4 text-xs font-medium">
-          <span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:stars-linear"></iconify-icon> 5.0</span>
-          <span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:calendar-linear"></iconify-icon> Mar&ccedil;o 2025</span>
-        </div>
-      </div>
-      <!-- Depoimento 2 -->
-      <div class="group bg-white p-8 border border-[#EBE9E4] hover:shadow-lg hover:shadow-gray-100 transition-all duration-500">
-        <div class="text-xs text-[#8F9A90] uppercase tracking-widest mb-3">Modelagem Corporal</div>
-        <h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Camila Santos, 35 anos</h3>
-        <p class="text-sm text-gray-500 mb-6">&ldquo;A criolip&oacute;lise superou todas as minhas expectativas. Perdi medidas na regi&atilde;o abdominal e me sinto muito mais confiante. Recomendo demais!&rdquo;</p>
-        <div class="flex items-center gap-4 text-xs font-medium">
-          <span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:stars-linear"></iconify-icon> 5.0</span>
-          <span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:calendar-linear"></iconify-icon> Janeiro 2025</span>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== CTA FINAL ===================== -->
-<section id="contato" class="py-40 px-8 bg-[#EBE9E4] text-center">
-  <div class="max-w-3xl mx-auto">
-    <h2 class="text-4xl md:text-5xl tracking-tight mb-8" style="font-family: 'Cormorant Garamond', serif;">
-      Vamos cuidar da sua beleza juntos?
-    </h2>
-    <p class="text-base text-gray-600 mb-12 font-light leading-relaxed">
-      Agende uma avalia&ccedil;&atilde;o gratuita e descubra o protocolo ideal para voc&ecirc;. Nossa equipe est&aacute; pronta para transformar sua autoestima com seguran&ccedil;a e excel&ecirc;ncia.
-    </p>
-    <div class="flex flex-col sm:flex-row justify-center items-center gap-6">
-      <a class="w-full sm:w-auto bg-[#1A1A1A] text-white text-sm uppercase tracking-widest px-10 py-5 rounded-full hover:bg-black transition-colors duration-300" href="#">
-        Agendar avalia&ccedil;&atilde;o gratuita
-      </a>
-      <a class="w-full sm:w-auto border border-[#1A1A1A] text-[#1A1A1A] text-sm uppercase tracking-widest px-10 py-5 rounded-full hover:bg-[#1A1A1A] hover:text-white transition-colors duration-300" href="#">
-        Falar no WhatsApp
-      </a>
-    </div>
-  </div>
-</section>
-
-<!-- ===================== FOOTER ===================== -->
-<footer class="bg-white pt-24 pb-12 px-8 border-t border-[#EBE9E4]">
-  <div class="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-4 gap-12 mb-20">
-    <div class="col-span-1 md:col-span-2">
-      <div class="text-2xl tracking-tighter uppercase font-medium mb-6 text-[#1A1A1A]">Lumify Est&eacute;tica</div>
-      <p class="text-sm text-gray-500 max-w-xs font-light">
-        Cl&iacute;nica de est&eacute;tica avan&ccedil;ada com tecnologia de ponta, protocolos cient&iacute;ficos e atendimento humanizado em S&atilde;o Paulo.
-      </p>
-    </div>
-    <div>
-      <h4 class="text-xs uppercase tracking-widest text-[#1A1A1A] mb-6">Tratamentos</h4>
-      <ul class="space-y-4 text-sm text-gray-500 font-light">
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#servicos">Rosto &amp; Anti-idade</a></li>
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#servicos">Modelagem Corporal</a></li>
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#servicos">Depila&ccedil;&atilde;o a Laser</a></li>
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#servicos">Skin Tech &amp; IA</a></li>
-      </ul>
-    </div>
-    <div>
-      <h4 class="text-xs uppercase tracking-widest text-[#1A1A1A] mb-6">Cl&iacute;nica</h4>
-      <ul class="space-y-4 text-sm text-gray-500 font-light">
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#sobre">Sobre n&oacute;s</a></li>
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#depoimentos">Depoimentos</a></li>
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#contato">Contato</a></li>
-        <li><a class="hover:text-[#BBA88E] transition-colors" href="#">Pol&iacute;tica de privacidade</a></li>
-      </ul>
-    </div>
-  </div>
-  <div class="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center pt-8 border-t border-[#EBE9E4] text-xs text-gray-400 font-light">
-    <p>&copy; 2026 Lumify Est&eacute;tica. Todos os direitos reservados.</p>
-    <div class="flex gap-6 mt-4 md:mt-0">
-      <a class="hover:text-[#1A1A1A] transition-colors" href="#">Instagram</a>
-      <a class="hover:text-[#1A1A1A] transition-colors" href="#">WhatsApp</a>
-      <a class="hover:text-[#1A1A1A] transition-colors" href="#">Mentions l&eacute;gales</a>
-    </div>
-  </div>
-</footer>
-
+<link href="assets/css2_61218cbecd6c.css" rel="stylesheet"/><!-- aura-ga4-start -->
+<script async="" src="assets/js_19c0e2c2c8a8.js"></script>
 <script>
-(function() {
-  var carousel = document.getElementById('tech-carousel');
-  var dots = document.querySelectorAll('#carousel-dots > div');
-  if (!carousel || !dots.length) return;
-  carousel.addEventListener('scroll', function() {
-    var cards = carousel.querySelectorAll('.snap-start');
-    var scrollLeft = carousel.scrollLeft;
-    var cardWidth = cards[0] ? cards[0].offsetWidth + 32 : 400;
-    var active = Math.round(scrollLeft / cardWidth);
-    active = Math.max(0, Math.min(active, dots.length - 1));
-    for (var i = 0; i < dots.length; i++) {
-      dots[i].style.backgroundColor = i === active ? 'rgba(255,255,255,1)' : 'rgba(255,255,255,0.2)';
-    }
-  });
-})();
+window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', 'G-2M6V79H761');
 </script>
-</body></html>
+<!-- aura-ga4-end -->
+<style data-scroll-fix="true">
+        /* Scroll fixes for offline viewing */
+        html, body {
+            overflow: auto !important;
+            overflow-x: hidden !important;
+            height: auto !important;
+            min-height: 100% !important;
+            scroll-behavior: auto !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+        }
+        
+        /* Force visibility - many sites use JS animations for initial display */
+        body, .wrapper, main, #__next, #app, .page, .content {
+            opacity: 1 !important;
+            visibility: visible !important;
+            transform: none !important;
+        }
+        
+        /* Disable loader/preloader overlays */
+        .loader, .preloader, .loading, [class*="loader"], [class*="preloader"] {
+            display: none !important;
+            opacity: 0 !important;
+        }
+        
+        /* Show elements that might be hidden for animation */
+        .word-inner, .char, .line, [data-aos], [data-scroll],
+        .hero-text span, .hero-fade, [class*="hero"] span {
+            opacity: 1 !important;
+            transform: none !important;
+            visibility: visible !important;
+        }
+        
+        /* Reset Tailwind animation utility classes */
+        .translate-y-full, .translate-x-full, .-translate-y-full, .-translate-x-full,
+        .translate-y-1\/2, .-translate-y-1\/2, .translate-y-\[100\%\], .translate-y-\[110\%\] {
+            transform: none !important;
+        }
+        
+        /* Force visibility on common hidden-for-animation patterns */
+        .opacity-0, [class*="opacity-0"] {
+            opacity: 1 !important;
+        }
+        
+        /* Reset scale transforms used for animations */
+        .scale-0, .scale-50, .scale-75 {
+            transform: none !important;
+        }
+        
+        html.lenis, html.lenis-smooth, 
+        body.lenis, body.lenis-smooth,
+        .lenis-wrapper, .lenis-content,
+        [data-lenis-prevent], [data-scroll-container] {
+            overflow: visible !important;
+            height: auto !important;
+        }
+        
+        /* Fix flex containers that might cut off content */
+        body.flex.items-center,
+        body.flex.justify-center {
+            align-items: flex-start !important;
+            min-height: 100vh;
+            height: auto !important;
+        }
+        
+        /* Ensure main content scrolls */
+        main, #__next, #__nuxt, #app, .main-content {
+            overflow: visible !important;
+            height: auto !important;
+        }
+        </style></head>
+<body class="antialiased text-[#1A1A1A] bg-[#F9F8F6] font-light selection:bg-[#BBA88E] selection:text-white" style="font-family: 'Inter', sans-serif;">
+<!-- Navigation -->
+<nav class="absolute w-full z-50 py-6 px-8 flex justify-between items-center text-white mix-blend-difference">
+<a class="text-xl tracking-tighter uppercase font-medium" href="#">Lumify Estética</a>
+<div class="hidden md:flex gap-12 text-sm tracking-wide">
+<a class="hover:text-[#BBA88E] transition-colors" href="#tecnologias">Tecnologias</a>
+<a class="hover:text-[#BBA88E] transition-colors" href="#especializacao">Especialização</a>
+<a class="hover:text-[#BBA88E] transition-colors" href="#masterclass">Masterclass</a>
+</div>
+<a class="text-xs uppercase tracking-widest border border-white/30 px-6 py-3 rounded-full hover:bg-white hover:text-black transition-colors" href="https://wa.me/554888721165">Contato</a>
+</nav>
+<!-- 1. Hero Section -->
+<header class="relative min-h-screen flex items-center pt-24 pb-32 overflow-hidden bg-[#1A1A1A]">
+<!-- Background Image with Overlay -->
+<div class="absolute inset-0 bg-cover bg-center opacity-60 bg-[url(https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/variants/08f0e618-c8f0-4948-b2e8-28376317b11c/1600w.jpg)]"></div>
+<div class="absolute top-0 right-0 bottom-0 left-0 bg-[#1A1A1A] overflow-hidden">
+<video autoplay="" class="absolute inset-0 w-full h-full object-cover opacity-60" loop="" muted="" playsinline="">
+<source src="assets/NEW-VIDEO-SLIDER_d843b950f411.mp4" type="video/mp4"/>
+</video>
+<div class="absolute inset-0 bg-gradient-to-r from-[#1A1A1A]/90 via-[#1A1A1A]/50 to-transparent"></div>
+</div>
+<div class="relative z-10 w-full max-w-7xl mx-auto px-8 flex flex-col lg:flex-row justify-between items-center gap-16 lg:gap-8">
+<!-- Left: Typography -->
+<div class="max-w-2xl text-white">
+<h1 class="text-5xl md:text-6xl lg:text-7xl font-normal tracking-tight leading-tight mb-8" style="font-family: 'Cormorant Garamond', serif;">
+      Tecnologias estéticas premium para profissionais exigentes.
+    </h1>
+<p class="text-base md:text-lg text-white/80 font-light mb-12 max-w-lg leading-relaxed">
+      Rosto, corpo, depilação definitiva, diagnóstico e acompanhamento personalizado para evoluir o seu cardápio de
+      serviços.
+    </p>
+<div class="flex flex-wrap items-center gap-6">
+<a class="bg-white text-[#1A1A1A] text-sm uppercase tracking-widest px-8 py-4 rounded-full hover:bg-[#BBA88E] hover:text-white transition-colors duration-500" href="#tecnologias">
+        Conheça nossas tecnologias
+      </a>
+<a class="flex items-center gap-3 text-sm uppercase tracking-widest text-white hover:text-[#BBA88E] transition-colors duration-500" href="https://wa.me/554888721165">
+        Fale conosco
+        <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
+</a>
+</div>
+</div>
+<!-- Right: Floating Card -->
+<div class="w-full max-w-md bg-white/5 backdrop-blur-xl border border-white/10 p-8 rounded-sm text-white">
+<div class="text-xs uppercase tracking-widest text-[#BBA88E] mb-8">Seu projeto de equipamento</div>
+<div class="space-y-6">
+<a class="group flex items-center justify-between border-b border-white/10 pb-6 hover:border-white/40 transition-colors" href="https://wa.me/554888721165">
+<div class="flex items-center gap-4">
+<iconify-icon class="text-2xl text-white/50 group-hover:text-[#BBA88E] transition-colors" icon="solar:stars-linear"></iconify-icon>
+<span class="text-lg font-light tracking-wide">Renovar minhas tecnologias</span>
+</div>
+<iconify-icon class="text-xl opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" icon="solar:alt-arrow-right-linear"></iconify-icon>
+</a>
+<a class="group flex items-center justify-between border-b border-white/10 pb-6 hover:border-white/40 transition-colors" href="https://wa.me/554888721165">
+<div class="flex items-center gap-4">
+<iconify-icon class="text-2xl text-white/50 group-hover:text-[#BBA88E] transition-colors" icon="solar:buildings-linear"></iconify-icon>
+<span class="text-lg font-light tracking-wide">Abrir um novo centro</span>
+</div>
+<iconify-icon class="text-xl opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" icon="solar:alt-arrow-right-linear"></iconify-icon>
+</a>
+<a class="group flex items-center justify-between pb-2 hover:border-white/40 transition-colors" href="https://wa.me/554888721165">
+<div class="flex items-center gap-4">
+<iconify-icon class="text-2xl text-white/50 group-hover:text-[#BBA88E] transition-colors" icon="solar:graph-up-linear"></iconify-icon>
+<span class="text-lg font-light tracking-wide">Aumentar meu faturamento</span>
+</div>
+<iconify-icon class="text-xl opacity-0 -translate-x-4 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-300" icon="solar:alt-arrow-right-linear"></iconify-icon>
+</a>
+</div>
+</div>
+</div>
+<!-- Mini Banner Sub-nav -->
+<div class="absolute bottom-0 w-full border-t border-white/10 bg-[#1A1A1A]/60 backdrop-blur-md">
+<div class="max-w-7xl mx-auto px-8 flex flex-wrap justify-between items-center py-5 text-xs text-white/60 uppercase tracking-[0.2em]">
+<span class="hover:text-white cursor-pointer transition-colors">Rosto</span>
+<span class="hover:text-white cursor-pointer transition-colors">Corpo</span>
+<span class="hover:text-white cursor-pointer transition-colors">Depilação</span>
+<span class="hover:text-white cursor-pointer transition-colors">Scanner IA</span>
+<span class="hover:text-[#BBA88E] cursor-pointer transition-colors">Masterclass</span>
+</div>
+</div>
+</header>
+<!-- 2. Por que Lumify Estética -->
+<section class=”py-32 px-8 max-w-7xl mx-auto” id=”especializacao”>
+<div class=”mb-20 max-w-3xl”>
+<h2 class=”text-4xl md:text-5xl tracking-tight leading-tight mb-6” style=”font-family: 'Cormorant Garamond', serif;”>
+      A excelência clínica aplicada<br/>ao desenvolvimento do seu instituto.
+    </h2>
+<p class=”text-base text-gray-500”>Uma abordagem global que protege seu investimento e garante resultados
+      duradouros.</p>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-x-8 gap-y-12">
+<!-- Card 1 -->
+<div class="relative group">
+<div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">01</div>
+<h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Tecnologias selecionadas</h3>
+<p class="text-sm text-gray-500 leading-relaxed">
+        Equipamentos auditados por sua eficácia clínica, confiabilidade técnica e rentabilidade no
+        mercado brasileiro.
+      </p>
+</div>
+<!-- Card 2 -->
+<div class="relative group">
+<div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">02</div>
+<h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Acompanhamento 360°</h3>
+<p class="text-sm text-gray-500 leading-relaxed">
+        Desde o estudo de viabilidade até a instalação física, estruturamos o projeto ao seu lado.
+      </p>
+</div>
+<!-- Card 3 -->
+<div class="relative group">
+<div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">03</div>
+<h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Formação contínua</h3>
+<p class="text-sm text-gray-500 leading-relaxed">
+        Capacitação teórica e prática para garantir resultados consistentes e segurança nos seus protocolos.
+      </p>
+</div>
+<!-- Card 4 -->
+<div class="relative group">
+<div class="text-4xl text-[#EBE9E4] mb-6 group-hover:text-[#BBA88E] transition-colors duration-500" style="font-family: 'Cormorant Garamond', serif;">04</div>
+<h3 class="text-lg tracking-tight mb-4 border-b border-[#EBE9E4] pb-4">Acompanhamento de performance</h3>
+<p class="text-sm text-gray-500 leading-relaxed">
+        Suporte marketing, manutenção preventiva e reuniões periódicas para otimizar a taxa de ocupação do
+        equipamento.
+      </p>
+</div>
+</div>
+</section>
+<!-- 3. Seus universos de tratamento -->
+<section class="bg-[#EBE9E4] py-32 px-8">
+<div class="max-w-7xl mx-auto">
+<h2 class="text-4xl tracking-tight mb-16 text-center" style="font-family: 'Cormorant Garamond', serif;">
+                Seus universos de tratamento
+            </h2>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<!-- Rosto -->
+<a class="group relative aspect-[4/3] overflow-hidden bg-white" href="#">
+<img alt="Rosto" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-80 mix-blend-multiply grayscale group-hover:grayscale-0" src="assets/photo-1512290923902-8a9f81dc23_f2e87609eee3.avif"/>
+<div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/80 via-[#1A1A1A]/20 to-transparent"></div>
+<div class="absolute bottom-0 left-0 p-10 w-full text-white">
+<div class="flex justify-between items-end">
+<div>
+<h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Rosto &amp; Anti-idade</h3>
+<p class="text-sm text-white/70 font-light max-w-sm">Rejuvenescimento celular, tratamento de imperfeições e protocolos exclusivos.</p>
+</div>
+<div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
+<iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
+</div>
+</div>
+</div>
+</a>
+<!-- Corpo -->
+<a class="group relative aspect-[4/3] overflow-hidden bg-white" href="#">
+<img alt="Corpo" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-80 mix-blend-multiply grayscale group-hover:grayscale-0" src="assets/photo-1515377905703-c4788e51af_0406bb830301.avif"/>
+<div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/80 via-[#1A1A1A]/20 to-transparent"></div>
+<div class="absolute bottom-0 left-0 p-10 w-full text-white">
+<div class="flex justify-between items-end">
+<div>
+<h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Remodelamento Corporal</h3>
+<p class="text-sm text-white/70 font-light max-w-sm">Criolipólise, ondas eletromagnéticas e redução localizada de volumes.</p>
+</div>
+<div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
+<iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
+</div>
+</div>
+</div>
+</a>
+<!-- Depilação -->
+<a class="group relative aspect-[4/3] overflow-hidden bg-white" href="#">
+<img alt="Depilação" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-80 mix-blend-multiply grayscale group-hover:grayscale-0" src="assets/photo-1570172619644-dfd03ed5d8_69c38799dd14.avif"/>
+<div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/80 via-[#1A1A1A]/20 to-transparent"></div>
+<div class="absolute bottom-0 left-0 p-10 w-full text-white">
+<div class="flex justify-between items-end">
+<div>
+<h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Depilação Definitiva</h3>
+<p class="text-sm text-white/70 font-light max-w-sm">Laser diode de alta potência para todos os fototipos, rápido e indolor.</p>
+</div>
+<div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
+<iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
+</div>
+</div>
+</div>
+</a>
+<!-- Diagnóstico -->
+<a class="group relative aspect-[4/3] overflow-hidden bg-[#1A1A1A]" href="#">
+<img alt="Diagnostic IA" class="absolute inset-0 w-full h-full object-cover transition-transform duration-1000 group-hover:scale-105 opacity-40 mix-blend-luminosity" src="assets/photo-1581091226825-a6a2a5aee1_75d2593c36e4.avif"/>
+<div class="absolute inset-0 bg-gradient-to-t from-[#1A1A1A]/90 via-[#1A1A1A]/40 to-transparent"></div>
+<div class="absolute top-10 right-10">
+<span class="bg-[#BBA88E] text-white text-xs uppercase tracking-widest px-4 py-2 rounded-full">Novo</span>
+</div>
+<div class="absolute bottom-0 left-0 p-10 w-full text-white">
+<div class="flex justify-between items-end">
+<div>
+<h3 class="text-3xl tracking-tight mb-3" style="font-family: 'Cormorant Garamond', serif;">Diagnóstico &amp; IA</h3>
+<p class="text-sm text-white/70 font-light max-w-sm">Análise cutânea por inteligência artificial para prescrever com precisão.</p>
+</div>
+<div class="w-12 h-12 rounded-full border border-white/30 flex items-center justify-center group-hover:bg-white group-hover:text-[#1A1A1A] transition-all duration-300">
+<iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
+</div>
+</div>
+</div>
+</a>
+</div>
+</div>
+</section>
+<!-- 4. Para quem? -->
+<section class="py-32 px-8 max-w-7xl mx-auto border-b border-[#EBE9E4]">
+<div class="text-center mb-20">
+<h2 class="text-4xl tracking-tight mb-6" style="font-family: 'Cormorant Garamond', serif;">
+                Uma solução tecnológica para cada perfil
+            </h2>
+<p class="text-sm uppercase tracking-widest text-gray-400">Escolha sua área de atuação</p>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-px bg-[#EBE9E4] border border-[#EBE9E4]">
+<!-- Perfil 1 -->
+<div class="bg-[#F9F8F6] p-12 hover:bg-white transition-colors duration-500">
+<div class="w-12 h-12 bg-[#EBE9E4] rounded-full flex items-center justify-center mb-8">
+<iconify-icon class="text-2xl text-[#1A1A1A]" icon="solar:shop-linear"></iconify-icon>
+</div>
+<h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Institutos de beleza</h3>
+<p class="text-sm text-gray-500 mb-8 min-h-[4rem]">Diferencie-se com tratamentos de alta tecnologia e fidelize com resultados visíveis desde a primeira sessão.</p>
+<ul class="space-y-3 mb-10 text-sm">
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Tecnologias hands-free</li>
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Alta rentabilidade por hora</li>
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Kit marketing de lançamento</li>
+</ul>
+<a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] hover:text-[#BBA88E] transition-colors pb-1 border-b border-[#1A1A1A] hover:border-[#BBA88E]" href="https://wa.me/554888721165">
+                    Ver o acompanhamento
+                </a>
+</div>
+<!-- Perfil 2 -->
+<div class="bg-[#F9F8F6] p-12 hover:bg-white transition-colors duration-500">
+<div class="w-12 h-12 bg-[#EBE9E4] rounded-full flex items-center justify-center mb-8">
+<iconify-icon class="text-2xl text-[#1A1A1A]" icon="solar:stethoscope-linear"></iconify-icon>
+</div>
+<h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Enfermeiros &amp; Profissionais</h3>
+<p class="text-sm text-gray-500 mb-8 min-h-[4rem]">Aproveite sua expertise médica para oferecer protocolos estéticos avançados com total segurança.</p>
+<ul class="space-y-3 mb-10 text-sm">
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Protocolos rigorosos</li>
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Masterclass dedicados</li>
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Auxílio na instalação</li>
+</ul>
+<a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] hover:text-[#BBA88E] transition-colors pb-1 border-b border-[#1A1A1A] hover:border-[#BBA88E]" href="https://wa.me/554888721165">
+                    Conheça a oferta
+                </a>
+</div>
+<!-- Perfil 3 -->
+<div class="bg-[#F9F8F6] p-12 hover:bg-white transition-colors duration-500">
+<div class="w-12 h-12 bg-[#EBE9E4] rounded-full flex items-center justify-center mb-8">
+<iconify-icon class="text-2xl text-[#1A1A1A]" icon="solar:health-linear"></iconify-icon>
+</div>
+<h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Médicos estéticos</h3>
+<p class="text-sm text-gray-500 mb-8 min-h-[4rem]">Complemente sua oferta de injetáveis com plataformas multi-tecnologia para um atendimento global.</p>
+<ul class="space-y-3 mb-10 text-sm">
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Sinergia terapêutica</li>
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Equipamentos certificados</li>
+<li class="flex items-center gap-3"><div class="w-1 h-1 bg-[#BBA88E] rounded-full"></div> Suporte prioritário</li>
+</ul>
+<a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] hover:text-[#BBA88E] transition-colors pb-1 border-b border-[#1A1A1A] hover:border-[#BBA88E]" href="https://wa.me/554888721165">
+                    Contato dedicado
+                </a>
+</div>
+</div>
+</section>
+<!-- 5 & 6. Tecnologia + Resultados -->
+<section class="py-32 px-8 max-w-7xl mx-auto">
+<div class="flex flex-col lg:flex-row gap-20 items-center">
+<div class="flex-1 space-y-12">
+<div class="">
+<h2 class="text-4xl tracking-tight mb-6" style="font-family: ‘Cormorant Garamond’, serif;">
+                        Mais que um equipamento,<br/>um parceiro de crescimento.
+                    </h2>
+<p class="text-base text-gray-500 max-w-md">
+                        Não entregamos apenas uma máquina. Estruturamos com você uma oferta de serviços rentável e desejável para sua clientela.
+                    </p>
+</div>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-8">
+<div class="border-l border-[#BBA88E] pl-6">
+<iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:chart-square-linear"></iconify-icon>
+<h4 class="text-base font-medium mb-2">Estudo de rentabilidade</h4>
+<p class="text-xs text-gray-500">Plano de negócio e cálculo do ROI antes do investimento.</p>
+</div>
+<div class="border-l border-[#BBA88E] pl-6">
+<iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:diploma-linear"></iconify-icon>
+<h4 class="text-base font-medium mb-2">Formação contínua</h4>
+<p class="text-xs text-gray-500">Certificação da sua equipe nos protocolos exclusivos.</p>
+</div>
+<div class="border-l border-[#BBA88E] pl-6">
+<iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:gallery-linear"></iconify-icon>
+<h4 class="text-base font-medium mb-2">Materiais de Marketing</h4>
+<p class="text-xs text-gray-500">Materiais visuais, conteúdo para redes sociais e estratégias de lançamento.</p>
+</div>
+<div class="border-l border-[#BBA88E] pl-6">
+<iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:settings-linear"></iconify-icon>
+<h4 class="text-base font-medium mb-2">Suporte Técnico Ágil</h4>
+<p class="text-xs text-gray-500">Intervenção rápida para garantir a continuidade dos seus atendimentos.</p>
+</div>
+</div>
+</div>
+<div class="flex-1 w-full relative">
+<!-- Abstract/Clinical graphic representation -->
+<div class="aspect-square bg-[#EBE9E4] relative p-8">
+<div class="absolute inset-0 bg-[url('https://images.unsplash.com/photo-1629909613654-28e377c37b09?q=80&amp;w=1200&amp;auto=format&amp;fit=crop')] bg-cover bg-center mix-blend-luminosity opacity-40"></div>
+<div class="relative z-10 h-full flex flex-col justify-between">
+<div class="self-end bg-white p-6 shadow-sm max-w-[200px]">
+<div class="text-3xl text-[#BBA88E] mb-1" style="font-family: 'Cormorant Garamond', serif;">+45%</div>
+<div class="text-xs text-gray-500 uppercase tracking-wider">Aumento no ticket médio observado</div>
+</div>
+<div class="bg-[#1A1A1A] p-6 shadow-sm max-w-[240px] text-white">
+<iconify-icon class="text-2xl text-[#8F9A90] mb-3" icon="solar:verified-check-linear"></iconify-icon>
+<div class="text-sm font-medium mb-1">Diferenciação garantida</div>
+<div class="text-xs text-white/60">Suba de nível com protocolos exclusivos.</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</section>
+<!-- 8. Seleção de tecnologias -->
+<section class="overflow-hidden text-white bg-[#1A1A1A] pt-32 pr-8 pb-32 pl-8">
+<div class="max-w-7xl mx-auto">
+<div class="flex justify-between items-end mb-16">
+<div class="">
+<h2 class="text-4xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;" id="tecnologias">
+                        Excelência Tecnológica
+                    </h2>
+<p class="text-sm text-white/60 max-w-sm">Uma seleção dos nossos equipamentos de destaque para redefinir os padrões da beleza.</p>
+</div>
+<div class="hidden md:flex gap-4">
+<button class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
+<iconify-icon class="text-xl" icon="solar:arrow-left-linear"></iconify-icon>
+</button>
+<button class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
+<iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
+</button>
+</div>
+</div>
+<div class="flex gap-8 overflow-x-auto pb-8 snap-x scrollbar-hide" style="scrollbar-width: none;">
+<!-- Tech 1 -->
+<div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
+<div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
+<img alt="Delta Lift" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="assets/photo-1596755389378-c31d21fd12_99de9d4481f1.jpg"/>
+<div class="group-hover:border-[#BBA88E]/50 transition-colors duration-500 border-white/10 border absolute top-0 right-0 bottom-0 left-0"></div>
+</div>
+<div class="flex justify-between items-start">
+<div>
+<div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Tratamento Anti-idade Global</div>
+<h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Delta Lift</h3>
+<p class="text-sm text-white/50">Radiofrequência fracionada</p>
+</div>
+<iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
+</div>
+</div>
+<!-- Tech 2 -->
+<div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
+<div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
+<img alt="Jetskin Pro" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="assets/photo-1542833807-ad5af0977050_d75dd64a3aec.jpg"/>
+<div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
+</div>
+<div class="flex justify-between items-start">
+<div>
+<div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Limpeza Profunda</div>
+<h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Jetskin Pro</h3>
+<p class="text-sm text-white/50">Hidrodermoabrasão avançada</p>
+</div>
+<iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
+</div>
+</div>
+<!-- Tech 3 -->
+<div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
+<div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
+<img alt="Novashape" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="assets/photo-1670201203208-055d6d79db_910cb2629d6e.jpg"/>
+<div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
+</div>
+<div class="flex justify-between items-start">
+<div>
+<div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Remodelamento Corporal</div>
+<h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Novashape</h3>
+<p class="text-sm text-white/50">Ondas eletromagnéticas</p>
+</div>
+<iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
+</div>
+</div>
+<!-- Tech 4 -->
+<div class="min-w-[300px] md:min-w-[400px] snap-start group cursor-pointer">
+<div class="aspect-[3/4] bg-[#2A2A2A] relative mb-6 overflow-hidden flex items-center justify-center">
+<img alt="Deltadiode+" class="w-full h-full object-cover mix-blend-luminosity opacity-60 group-hover:mix-blend-normal group-hover:opacity-100 group-hover:scale-105 transition-all duration-700" src="assets/photo-1512290923902-8a9f81dc23_7bd5b97a4132.jpg"/>
+<div class="absolute inset-0 border border-white/10 group-hover:border-[#BBA88E]/50 transition-colors duration-500"></div>
+</div>
+<div class="flex justify-between items-start">
+<div>
+<div class="text-xs text-[#BBA88E] uppercase tracking-widest mb-2">Depilação Definitiva</div>
+<h3 class="text-2xl tracking-tight mb-1" style="font-family: 'Cormorant Garamond', serif;">Deltadiode+</h3>
+<p class="text-sm text-white/50">Laser Diodo 3 ondas</p>
+</div>
+<iconify-icon class="text-2xl text-white/30 group-hover:text-white transition-colors" icon="solar:add-circle-linear"></iconify-icon>
+</div>
+</div>
+</div>
+<!-- Custom scrollbar/progress indicator style -->
+<div class="mt-8 flex gap-2">
+<div class="h-[2px] w-12 bg-white"></div>
+<div class="h-[2px] w-12 bg-white/20"></div>
+<div class="h-[2px] w-12 bg-white/20"></div>
+</div>
+</div>
+</section>
+<!-- 7. Masterclass -->
+<section class="py-32 px-8 max-w-7xl mx-auto">
+<div class="flex flex-col lg:flex-row gap-16">
+<div class="lg:w-1/3">
+<div class="sticky top-32">
+<h2 class="text-4xl tracking-tight mb-6" style="font-family: 'Cormorant Garamond', serif;" id="masterclass">
+                        A Academia<br/>Lumify Estética
+                    </h2>
+<p class="text-sm text-gray-500 mb-8 leading-relaxed">
+                        Formatos de treinamento imersivos para dominar os últimos avanços em estética, aperfeiçoar suas técnicas e desenvolver a atratividade do seu centro.
+                    </p>
+<a class="inline-flex items-center gap-2 text-sm uppercase tracking-widest text-[#1A1A1A] pb-1 border-b border-[#1A1A1A] hover:text-[#BBA88E] hover:border-[#BBA88E] transition-colors" href="https://wa.me/554888721165">
+                        Ver todas as datas
+                    </a>
+</div>
+</div>
+<div class="lg:w-2/3 space-y-8">
+<!-- Card Masterclass 1 -->
+<a class="group flex flex-col md:flex-row gap-8 bg-white p-8 border border-[#EBE9E4] hover:shadow-lg hover:shadow-gray-100 transition-all duration-500" href="#">
+<div class="md:w-2/5 aspect-[4/3] bg-[#EBE9E4] overflow-hidden">
+<img alt="Formação" class="w-full h-full object-cover grayscale opacity-80 group-hover:scale-105 group-hover:grayscale-0 transition-all duration-700" src="assets/photo-1556760544-74068565f05c_e3c774542847.avif"/>
+</div>
+<div class="md:w-3/5 flex flex-col justify-center">
+<div class="text-xs text-[#8F9A90] uppercase tracking-widest mb-3">Para Esteticistas</div>
+<h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Masterclass Beauty Expert</h3>
+<p class="text-sm text-gray-500 mb-6">Dois dias de imersão para se tornar a referência anti-idade da sua região. Teoria celular, prática intensiva e protocolos combinados.</p>
+<div class="flex items-center gap-4 text-xs font-medium">
+<span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:calendar-linear"></iconify-icon> Florianópolis, SC - 12 Out</span>
+<span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:users-group-rounded-linear"></iconify-icon> 8 vagas restantes</span>
+</div>
+</div>
+</a>
+<!-- Card Masterclass 2 -->
+<a class="group flex flex-col md:flex-row gap-8 bg-white p-8 border border-[#EBE9E4] hover:shadow-lg hover:shadow-gray-100 transition-all duration-500" href="#">
+<div class="md:w-2/5 aspect-[4/3] bg-[#EBE9E4] overflow-hidden">
+<img alt="Formação Médica" class="w-full h-full object-cover grayscale opacity-80 group-hover:scale-105 group-hover:grayscale-0 transition-all duration-700" src="assets/photo-1579684385127-1ef15d5081_d5c9be8891b6.avif"/>
+</div>
+<div class="md:w-3/5 flex flex-col justify-center">
+<div class="text-xs text-[#8F9A90] uppercase tracking-widest mb-3">Para Enfermeiros &amp; Profissionais</div>
+<h3 class="text-2xl tracking-tight mb-4" style="font-family: 'Cormorant Garamond', serif;">Masterclass Clínico</h3>
+<p class="text-sm text-gray-500 mb-6">Aprofundamento das técnicas de laser e radiofrequência médica. Gestão de complicações e otimização de parâmetros.</p>
+<div class="flex items-center gap-4 text-xs font-medium">
+<span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:calendar-linear"></iconify-icon> Florianópolis, SC - 24 Nov</span>
+<span class="flex items-center gap-2 border border-[#EBE9E4] px-3 py-1.5 rounded-full"><iconify-icon icon="solar:users-group-rounded-linear"></iconify-icon> Lista de espera</span>
+</div>
+</div>
+</a>
+</div>
+</div>
+</section>
+<!-- 9. Final CTA -->
+<section class="py-40 px-8 bg-[#EBE9E4] text-center">
+<div class="max-w-3xl mx-auto">
+<h2 class="text-4xl md:text-5xl tracking-tight mb-8" style="font-family: 'Cormorant Garamond', serif;">
+                Vamos conversar sobre o seu projeto de equipamento.
+            </h2>
+<p class="text-base text-gray-600 mb-12 font-light leading-relaxed">
+                Seja para ampliar seu cardápio de serviços, lançar um novo tratamento ou reposicionar seu centro, nossa equipe está pronta para ajudar.
+            </p>
+<div class="flex flex-col sm:flex-row justify-center items-center gap-6">
+<a class="w-full sm:w-auto bg-[#1A1A1A] text-white text-sm uppercase tracking-widest px-10 py-5 rounded-full hover:bg-black transition-colors duration-300" href="https://wa.me/554888721165">
+                    Fale conosco
+                </a>
+<a class="w-full sm:w-auto border border-[#1A1A1A] text-[#1A1A1A] text-sm uppercase tracking-widest px-10 py-5 rounded-full hover:bg-[#1A1A1A] hover:text-white transition-colors duration-300" href="https://wa.me/554888721165">
+                    Solicitar contato
+                </a>
+</div>
+</div>
+</section>
+<!-- 10. Footer -->
+<footer class="bg-white pt-24 pb-12 px-8 border-t border-[#EBE9E4]">
+<div class="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-4 gap-12 mb-20">
+<div class="col-span-1 md:col-span-2">
+<div class="text-2xl tracking-tighter uppercase font-medium mb-6 text-[#1A1A1A]">Lumify Estética</div>
+<p class="text-sm text-gray-500 max-w-xs font-light">
+                    Parceiro de referência em tecnologias estéticas para institutos e centros médicos em Florianópolis, SC.
+                </p>
+<p class="text-sm text-gray-500 max-w-xs font-light mt-4">
+                    <a class="hover:text-[#BBA88E] transition-colors" href="mailto:contato@lumifycompany.com.br">contato@lumifycompany.com.br</a>
+                </p>
+<p class="text-sm text-gray-500 max-w-xs font-light mt-2">
+                    <a class="hover:text-[#BBA88E] transition-colors" href="https://wa.me/554888721165">WhatsApp: (48) 8872-1165</a>
+                </p>
+</div>
+<div>
+<h4 class="text-xs uppercase tracking-widest text-[#1A1A1A] mb-6">Especialização</h4>
+<ul class="space-y-4 text-sm text-gray-500 font-light">
+<li><a class="hover:text-[#BBA88E] transition-colors" href="#tecnologias">Rosto &amp; Anti-idade</a></li>
+<li><a class="hover:text-[#BBA88E] transition-colors" href="#tecnologias">Remodelamento Corporal</a></li>
+<li><a class="hover:text-[#BBA88E] transition-colors" href="#tecnologias">Depilação Definitiva</a></li>
+</ul>
+</div>
+<div>
+<h4 class="text-xs uppercase tracking-widest text-[#1A1A1A] mb-6">Empresa</h4>
+<ul class="space-y-4 text-sm text-gray-500 font-light">
+<li><a class="hover:text-[#BBA88E] transition-colors" href="#especializacao">O acompanhamento</a></li>
+<li><a class="hover:text-[#BBA88E] transition-colors" href="#masterclass">Masterclass</a></li>
+<li><a class="hover:text-[#BBA88E] transition-colors" href="https://wa.me/554888721165">Financiamento</a></li>
+</ul>
+</div>
+</div>
+<div class="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center pt-8 border-t border-[#EBE9E4] text-xs text-gray-400 font-light">
+<p>© 2026 Lumify Estética. Todos os direitos reservados.</p>
+<div class="flex gap-6 mt-4 md:mt-0">
+<a class="hover:text-[#1A1A1A] transition-colors" href="https://www.instagram.com/lumifycompany/">Instagram</a>
+<a class="hover:text-[#1A1A1A] transition-colors" href="https://wa.me/554888721165">WhatsApp</a>
+</div>
+</div>
+</footer>
+<script data-img-fallback-handler="">!function(){var f=["https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/917d6f93-fb36-439a-8c48-884b67b35381_1600w.jpg","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/4734259a-bad7-422f-981e-ce01e79184f2_1600w.jpg","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/c543a9e1-f226-4ced-80b0-feb8445a75b9_1600w.jpg","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/5bab247f-35d9-400d-a82b-fd87cfe913d2_1600w.webp","https://hoirqrkdgbmvpwutwuwj.supabase.co/storage/v1/object/public/assets/assets/30104e3c-5eea-4b93-93e9-5313698a7156_1600w.webp"],h=new Set;function g(s){for(var x=0,i=0;i<s.length;i++)x=(x<<5)-x+s.charCodeAt(i)|0;return f[Math.abs(x)%f.length]}function r(t){var s=t.src;if(s&&!h.has(s)){h.add(s);t.src=g(s)}}window.addEventListener("error",function(e){var t=e.target;if(t&&t.tagName==="IMG")r(t)},!0);function c(){document.querySelectorAll("img").forEach(function(i){if(i.complete&&!i.naturalWidth&&i.src)r(i)})}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",c);else c()}()</script></body></html>
