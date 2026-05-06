@@ -355,10 +355,10 @@ html { scroll-behavior: smooth; }
         <p class="text-sm text-white/60 max-w-sm">Equipamentos de ponta para tratamentos que realmente funcionam.</p>
       </div>
       <div class="hidden md:flex gap-4">
-        <button class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
+        <button id="tech-prev" class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
           <iconify-icon class="text-xl" icon="solar:arrow-left-linear"></iconify-icon>
         </button>
-        <button class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
+        <button id="tech-next" class="w-12 h-12 rounded-full border border-white/20 flex items-center justify-center hover:bg-white hover:text-black transition-colors">
           <iconify-icon class="text-xl" icon="solar:arrow-right-linear"></iconify-icon>
         </button>
       </div>
@@ -538,17 +538,37 @@ html { scroll-behavior: smooth; }
 (function() {
   var carousel = document.getElementById('tech-carousel');
   var dots = document.querySelectorAll('#carousel-dots > div');
-  if (!carousel || !dots.length) return;
-  carousel.addEventListener('scroll', function() {
+  var prevBtn = document.getElementById('tech-prev');
+  var nextBtn = document.getElementById('tech-next');
+  if (!carousel) return;
+
+  function getCardWidth() {
     var cards = carousel.querySelectorAll('.snap-start');
-    var scrollLeft = carousel.scrollLeft;
-    var cardWidth = cards[0] ? cards[0].offsetWidth + 32 : 400;
-    var active = Math.round(scrollLeft / cardWidth);
-    active = Math.max(0, Math.min(active, dots.length - 1));
-    for (var i = 0; i < dots.length; i++) {
-      dots[i].style.backgroundColor = i === active ? 'rgba(255,255,255,1)' : 'rgba(255,255,255,0.2)';
-    }
-  });
+    return cards[0] ? cards[0].offsetWidth + 32 : 400;
+  }
+
+  if (prevBtn) {
+    prevBtn.addEventListener('click', function() {
+      carousel.scrollBy({ left: -getCardWidth(), behavior: 'smooth' });
+    });
+  }
+  if (nextBtn) {
+    nextBtn.addEventListener('click', function() {
+      carousel.scrollBy({ left: getCardWidth(), behavior: 'smooth' });
+    });
+  }
+
+  if (dots.length) {
+    carousel.addEventListener('scroll', function() {
+      var scrollLeft = carousel.scrollLeft;
+      var cardWidth = getCardWidth();
+      var active = Math.round(scrollLeft / cardWidth);
+      active = Math.max(0, Math.min(active, dots.length - 1));
+      for (var i = 0; i < dots.length; i++) {
+        dots[i].style.backgroundColor = i === active ? 'rgba(255,255,255,1)' : 'rgba(255,255,255,0.2)';
+      }
+    });
+  }
 })();
 </script>
 </body></html>
